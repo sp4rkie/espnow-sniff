@@ -1,0 +1,14 @@
+# build output
+espnow-inject
+
+# captures and the name table hold real MAC addresses
+*.pcap
+*.pcapng
+.espnow-names
+espnow-names
+
+# editor
+*.swp
+
+# local Claude Code settings
+.claude/settings.local.json*

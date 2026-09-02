@@ -1,0 +1,512 @@
+#!/bin/sh
+
+#
+# espnow-sniff - decode unencrypted ESP-NOW traffic seen by a monitor mode WiFi adapter
+#
+# ESP-NOW rides in an 802.11 vendor specific action frame (category 0x7f, OUI 18:fe:34,
+# element type 4). Wireshark has no ESP-NOW dissector, so this decodes the frame itself:
+# radiotap -> 802.11 header -> action body -> vendor elements -> payload.
+#
+# needs: root, gawk, tcpdump, iw, a monitor mode capable adapter (ath9k_htc, rt2800usb, ...)
+#
+# NOTE on style: the awk program below is emitted through a *quoted* heredoc, unlike the
+# rest of the awk-over-sh family here. This program is dense with awk sigils, backslashes
+# and regex atoms; an unquoted delimiter would need every one of them escaped twice. The
+# family shape is kept otherwise - generated program, self-rm from BEGIN, eval exec awk.
+# Options reach awk through -v instead of CLARGS, so there is no 20 argument limit.
+#
+
+PROG=`basename $0`
+
+MONIF=mon0
+#
+# ESP-NOW devices transmit on whichever channel they were configured for, which is
+# not necessarily the one their AP uses. Check the device config rather than guess,
+# or sweep with -c 0 first.
+#
+CHAN=6
+BASEIF=
+NAMES=
+PCAP_IN=
+PCAP_OUT=
+SECS=
+COUNT=
+ALL=0
+HEX=0
+QUIET=0
+KEEP=0
+FCSFAIL=0
+
+usage()
+{
+    cat >&2 << USAGE
+usage: $PROG [options]
+
+  -c CHAN    channel to listen on (0 = hop 1..13 to find traffic)   [$CHAN]
+  -i IFACE   base wifi interface to take the phy from               [auto]
+  -m MONIF   name of the monitor interface to create                [$MONIF]
+  -n FILE    MAC -> name table ("aa:bb:cc:dd:ee:ff  label" lines)   [\$HOME/.espnow-names]
+  -r FILE    decode an existing pcap instead of capturing live
+  -w FILE    also write the raw capture to FILE (pcap, radiotap)
+  -t SECS    stop after SECS seconds
+  -C COUNT   stop after COUNT frames
+  -a         show every vendor action frame, not just ESP-NOW
+  -x         hex dump the payload as well as the ASCII rendering
+  -q         no per frame lines, print the summary only
+  -F         create the monitor with fcsfail, so CRC failed frames are delivered
+             too (they are dropped in the driver otherwise, and never counted)
+  -k         keep the monitor interface on exit
+  -h         this help
+
+examples:
+  $PROG -c 1                        # watch channel 1
+  $PROG -c 1 -x -w /tmp/espnow.pcap # decode and archive at the same time
+  $PROG -c 0 -t 60                  # hop channels for a minute to locate the traffic
+  $PROG -r /tmp/espnow.pcap         # decode the archive again, no radio needed
+USAGE
+    exit 1
+}
+
+while getopts c:i:m:n:r:w:t:C:axqkFh OPT
+do
+    case $OPT in
+    c)  CHAN=$OPTARG ;;
+    i)  BASEIF=$OPTARG ;;
+    m)  MONIF=$OPTARG ;;
+    n)  NAMES=$OPTARG ;;
+    r)  PCAP_IN=$OPTARG ;;
+    w)  PCAP_OUT=$OPTARG ;;
+    t)  SECS=$OPTARG ;;
+    C)  COUNT=$OPTARG ;;
+    a)  ALL=1 ;;
+    x)  HEX=1 ;;
+    q)  QUIET=1 ;;
+    F)  FCSFAIL=1 ;;
+    k)  KEEP=1 ;;
+    *)  usage ;;
+    esac
+done
+
+[ -z "$NAMES" ] && [ -r "$HOME/.espnow-names" ] && NAMES=$HOME/.espnow-names
+[ -n "$NAMES" ] && [ ! -r "$NAMES" ] && { echo "$PROG: cannot read $NAMES" >&2; exit 1; }
+
+for t in gawk tcpdump
+do
+    command -v $t > /dev/null || { echo "$PROG: $t not found" >&2; exit 1; }
+done
+
+AWKF=`mktemp ${TMPDIR:-/tmp}/$PROG.XXXXXX` || exit 1
+
+cat > $AWKF << '!'
+
+#
+# pcap (radiotap) byte stream decoder. stdin is `od -An -tx1 -v` of a pcap file/stream,
+# so the whole thing stays inside gawk with no binary read support needed.
+#
+# B[]  ring of pending bytes,  P read pointer,  N write pointer
+#
+
+func rl16(o)    { return B[o] + B[o + 1] * 256 }
+func rl32(o)    { return B[o] + B[o + 1] * 256 + B[o + 2] * 65536 + B[o + 3] * 16777216 }
+func p32(o)     { return LE ? rl32(o) : B[o] * 16777216 + B[o+1] * 65536 + B[o+2] * 256 + B[o+3] }
+func s8(o, \
+    v)          { v = B[o]; return v > 127 ? v - 256 : v }
+func mac(o)     { return sprintf("%02x:%02x:%02x:%02x:%02x:%02x", \
+                      B[o], B[o+1], B[o+2], B[o+3], B[o+4], B[o+5]) }
+func nm(a)      { return (a in NAME) ? NAME[a] : a }
+func nmw(a, w)  { return substr(nm(a), 1, w) }
+
+func freq2chan(f)
+{
+    if (!f)                     return "?"
+    if (f == 2484)              return 14
+    if (f >= 2412 && f <= 2472) return (f - 2407) / 5
+    if (f >= 5000)              return (f - 5000) / 5
+    return "?"
+}
+
+func load_names(   line, f, n, i, v)
+{
+    if (NAMES == "")
+        return
+    while ((getline line < NAMES) > 0) {
+        sub(/^[ \t]*#.*/, "", line)      # only a leading # is a comment
+        if ((n = split(line, f)) < 2)
+            continue
+        v = f[2]
+        for (i = 3; i <= n; i++)
+            v = v " " f[i]
+        NAME[tolower(f[1])] = v
+    }
+    close(NAMES)
+}
+
+BEGIN {
+    # avoid a dangling include file. the running gawk keeps the open inode
+    if (AWKF != "")
+        system("rm -f " AWKF)
+
+    for (i = 0; i < 256; i++)
+        HEX2N[sprintf("%02x", i)] = i
+
+    # radiotap field table, bit 0..27 -> "size:alignment". bit 28+ is TLV/namespace, we stop there
+    n = split("8:8 1:1 1:1 4:2 2:1 1:1 1:1 2:2 2:2 2:2 1:1 1:1 1:1 1:1 2:2 2:2 " \
+              "1:1 1:1 8:4 3:1 8:4 12:2 12:8 12:2 12:2 6:2 1:1 4:2", t, " ")
+    for (i = 1; i <= n; i++) {
+        split(t[i], u, ":")
+        RT_SZ[i - 1] = u[1]
+        RT_AL[i - 1] = u[2]
+    }
+
+    load_names()
+    P = N = 0
+
+    if (!QUIET)
+        printf("%-15s %-4s %6s %6s %6s %-3s %3s  %-19s %-19s %4s  %s\n", \
+               "TIME", "CH", "RSSI", "RATE", "SEQ", "RTY", "VER", "SOURCE", "DEST", "LEN", "PAYLOAD")
+}
+
+{
+    for (i = 1; i <= NF; i++)
+        B[N++] = HEX2N[$i]
+    drain()
+}
+
+func drain(   caplen, tot, i)
+{
+    while (1) {
+        if (!GH) {
+            if (N - P < 24)
+                return
+            if (!ghdr())
+                exit 1
+            continue
+        }
+        if (N - P < 16)
+            return
+        caplen = p32(P + 8)
+        if (caplen < 0 || caplen > 262144) {
+            print "espnow-sniff: pcap stream out of sync" > "/dev/stderr"
+            exit 1
+        }
+        tot = 16 + caplen
+        if (N - P < tot)
+            return
+        pkt(P + 16, caplen, p32(P), p32(P + 4))
+        for (i = P; i < P + tot; i++)
+            delete B[i]
+        P += tot
+    }
+}
+
+func ghdr(   m, i)
+{
+    m = sprintf("%02x%02x%02x%02x", B[P], B[P+1], B[P+2], B[P+3])
+    if      (m == "d4c3b2a1") { LE = 1; NS = 0 }
+    else if (m == "a1b2c3d4") { LE = 0; NS = 0 }
+    else if (m == "4d3cb2a1") { LE = 1; NS = 1 }
+    else if (m == "a1b23c4d") { LE = 0; NS = 1 }
+    else {
+        printf("espnow-sniff: not a pcap stream (magic %s)\n", m) > "/dev/stderr"
+        return 0
+    }
+    if ((DLT = p32(P + 20)) != 127) {
+        printf("espnow-sniff: link type %d, need 127 (radiotap)\n", DLT) > "/dev/stderr"
+        return 0
+    }
+    for (i = P; i < P + 24; i++)
+        delete B[i]
+    P += 24
+    GH = 1
+    return 1
+}
+
+func pkt(o, caplen, ts, tsf, \
+    rl, fp, w, w0, nw, bit, a, sz, freq, rssi, rate, ant, flags, \
+    m, mlen, fc0, typ, styp, b, e, elen, ver, plen, i, sa, da, seq, oui, ch, tstr, asc, rty)
+{
+    TOTAL++
+    if (caplen < 8 || B[o] != 0)                    # radiotap version must be 0
+        return
+    rl = rl16(o + 2)
+    if (rl < 8 || rl > caplen)
+        return
+
+    # walk the present bitmap words, fields start after the last one
+    fp = o + 4
+    nw = 0
+    do {
+        w = rl32(fp)
+        fp += 4
+        if (++nw == 1)
+            w0 = w
+    } while (and(w, 0x80000000) && fp + 4 <= o + rl)
+
+    rssi = 999; freq = 0; rate = 0; ant = -1; flags = 0
+    for (bit = 0; bit <= 27; bit++) {
+        if (!and(w0, lshift(1, bit)))
+            continue
+        sz = RT_SZ[bit]
+        a  = RT_AL[bit]
+        fp = o + int(((fp - o) + a - 1) / a) * a    # each field aligns on its own size
+        if (fp + sz > o + rl)
+            break
+        if      (bit ==  1) flags = B[fp]
+        else if (bit ==  2) rate  = B[fp] / 2
+        else if (bit ==  3) freq  = rl16(fp)
+        else if (bit ==  5) rssi  = s8(fp)
+        else if (bit == 11) ant   = B[fp]
+        fp += sz
+    }
+
+    m    = o + rl
+    mlen = caplen - rl
+    if (and(flags, 0x40)) {                         # radiotap says the FCS is bad
+        BADFCS++
+        return
+    }
+    if (and(flags, 0x10))                           # FCS included at the end
+        mlen -= 4
+    if (mlen < 24)
+        return
+
+    fc0 = B[m]
+    typ = and(rshift(fc0, 2), 3)
+    styp = and(rshift(fc0, 4), 15)
+    if (typ != 0 || styp != 13)                     # management / action
+        return
+    da  = mac(m + 4)
+    sa  = mac(m + 10)
+    seq = rshift(rl16(m + 22), 4)
+    rty = and(B[m + 1], 0x08) ? "R" : ""      # 802.11 retransmission
+
+    b = m + 24
+    if (b + 8 > m + mlen || B[b] != 0x7f)           # category: vendor specific
+        return
+    oui = sprintf("%02x:%02x:%02x", B[b+1], B[b+2], B[b+3])
+    if (oui != "18:fe:34") {
+        if (!ALL)
+            return
+    }
+
+    # vendor elements. ESP-NOW v2 splits payloads > 250 bytes over several of them
+    plen = 0
+    ver  = -1
+    e    = b + 8
+    while (e + 2 <= m + mlen) {
+        elen = B[e + 1]
+        if (B[e] != 0xdd || e + 2 + elen > m + mlen)
+            break
+        if (elen >= 5 && B[e+2] == 0x18 && B[e+3] == 0xfe && B[e+4] == 0x34 && B[e+5] == 4) {
+            ver = B[e + 6]
+            for (i = e + 7; i < e + 2 + elen; i++)
+                PB[plen++] = B[i]
+        }
+        e += 2 + elen
+    }
+    if (ver < 0 && !ALL)
+        return
+
+    ESPNOW++
+    if (!T0) T0 = ts
+    T1 = ts
+
+    CNT[sa]++
+    PAIR[sa "\t" da]++
+    if (rty != "")
+        PRTY[sa "\t" da]++
+    LAST[sa] = plen
+    if (rssi != 999) {
+        RSUM[sa] += rssi
+        RN[sa]++
+        if (!(sa in RMIN) || rssi < RMIN[sa]) RMIN[sa] = rssi
+        if (!(sa in RMAX) || rssi > RMAX[sa]) RMAX[sa] = rssi
+    }
+
+    LASTP[sa] = ascii(plen)
+
+    if (QUIET)
+        return
+
+    ch   = freq2chan(freq)
+    tstr = strftime("%H:%M:%S", ts) sprintf(".%06d", NS ? int(tsf / 1000) : tsf)
+    asc  = LASTP[sa]
+
+    printf("%-15s %-4s %5s%s %5.1fM %6d %-3s %3s  %-19s %-19s %4d  \"%s\"%s\n", \
+        tstr, ch, \
+        (rssi == 999 ? "?" : rssi), (rssi == 999 ? " " : ""), \
+        rate, seq, rty, (ver < 0 ? "-" : ver), \
+        nmw(sa, 19), nmw(da, 19), plen, asc, \
+        (oui != "18:fe:34" ? "  [oui " oui "]" : ""))
+
+    if (SHOWHEX)
+        hexdump(plen)
+    fflush()
+}
+
+func ascii(n,   i, c, s)
+{
+    s = ""
+    for (i = 0; i < n; i++) {
+        c = PB[i]
+        if (i == n - 1 && c == 0)                   # drop the terminating NUL
+            break
+        s = s (c >= 32 && c < 127 ? sprintf("%c", c) : ".")
+    }
+    return s
+}
+
+func hexdump(n,   i, j, h, a, c)
+{
+    for (i = 0; i < n; i += 16) {
+        h = ""; a = ""
+        for (j = i; j < i + 16; j++) {
+            if (j < n) {
+                c = PB[j]
+                h = h sprintf("%02x ", c)
+                a = a (c >= 32 && c < 127 ? sprintf("%c", c) : ".")
+            } else
+                h = h "   "
+        }
+        printf("                %04x  %s %s\n", i, h, a)
+    }
+}
+
+END {
+    if (!ESPNOW) {
+        printf("\n--- no ESP-NOW frames (%d frames examined, %d bad FCS) ---\n", TOTAL, BADFCS)
+        exit
+    }
+    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds, %d dropped for bad FCS ---\n", \
+           ESPNOW, length(CNT), T1 - T0, BADFCS)
+    for (s in CNT)
+        printf("  %-19s %6d  rssi %4s/%4s/%4s dBm  last: \"%s\"\n", \
+            nm(s), CNT[s], \
+            (s in RMIN ? RMIN[s] : "?"), \
+            (RN[s] ? sprintf("%d", int(RSUM[s] / RN[s])) : "?"), \
+            (s in RMAX ? RMAX[s] : "?"), \
+            LASTP[s])
+
+    #
+    # a retry carries the same sequence number as its original, so FRAMES - RETRIES
+    # is the number of distinct sends. retries per send is the link quality figure:
+    # 0 is clean, ~32 means the transmitter hit the hardware limit and gave up
+    #
+    printf("\n  %-19s %-19s %6s %8s %11s\n", "FROM", "TO", "SENDS", "RETRIES", "RETRY/SEND")
+    fflush()
+    SORT = "sort -k5 -rn"
+    for (k in PAIR) {
+        first = PAIR[k] - PRTY[k]
+        split(k, p, "\t")
+        printf("  %-19s %-19s %6d %8d %11s\n", \
+            nmw(p[1], 19), nmw(p[2], 19), first, PRTY[k], \
+            first ? sprintf("%.1f", PRTY[k] / first) : "-") | SORT
+    }
+    close(SORT)
+}
+!
+
+AWKARGS="-v AWKF=$AWKF -v ALL=$ALL -v SHOWHEX=$HEX -v QUIET=$QUIET -v NAMES=$NAMES"
+
+#
+# offline: just re-decode a capture, no radio involved
+#
+if [ -n "$PCAP_IN" ]
+then
+    [ -r "$PCAP_IN" ] || { echo "$PROG: cannot read $PCAP_IN" >&2; rm -f $AWKF; exit 1; }
+    od -An -tx1 -v < "$PCAP_IN" | gawk -f $AWKF $AWKARGS
+    exit $?
+fi
+
+[ "`id -u`" != 0 ] && { echo "$PROG: needs root for monitor mode" >&2; rm -f $AWKF; exit 1; }
+command -v iw > /dev/null || { echo "$PROG: iw not found" >&2; rm -f $AWKF; exit 1; }
+
+#
+# pick the phy: the one behind -i, else the first that admits to monitor mode
+#
+if [ -n "$BASEIF" ]
+then
+    PHY=`iw dev $BASEIF info 2>/dev/null | awk '/wiphy/ { print "phy" $2; exit }'`
+else
+    for p in /sys/class/ieee80211/*
+    do
+        [ -e "$p" ] || continue
+        ph=`basename $p`
+        if iw phy $ph info 2>/dev/null | grep -q '^[[:space:]]*\* monitor$'
+        then
+            PHY=$ph
+            break
+        fi
+    done
+fi
+[ -z "$PHY" ] && { echo "$PROG: no monitor capable phy found" >&2; rm -f $AWKF; exit 1; }
+
+iw dev $MONIF del 2>/dev/null                  # a stale one must not become $BASEIF
+
+[ -z "$BASEIF" ] && BASEIF=`iw dev | awk -v phy="$PHY" -v skip="$MONIF" '
+    /^phy#/     { cur = "phy" substr($0, 5) }
+    /Interface/ { if (cur == phy && $2 != skip) { print $2; exit } }'`
+WASUP=0
+[ -n "$BASEIF" ] && WASUP=`ip -br link show $BASEIF 2>/dev/null | awk '{ print ($2 == "UP") ? 1 : 0 }'`
+HOPPID=
+
+cleanup()
+{
+    trap '' EXIT INT TERM HUP
+    [ -n "$HOPPID" ] && kill $HOPPID 2>/dev/null
+    if [ $KEEP -eq 0 ]
+    then
+        iw dev $MONIF del 2>/dev/null
+        [ "$WASUP" = "1" ] && [ -n "$BASEIF" ] && ip link set $BASEIF up 2>/dev/null
+    fi
+    rm -f $AWKF
+}
+trap cleanup EXIT INT TERM HUP
+
+[ -n "$BASEIF" ] && ip link set $BASEIF down 2>/dev/null
+MONFLAGS=none
+[ $FCSFAIL -eq 1 ] && MONFLAGS="fcsfail otherbss"
+iw phy $PHY interface add $MONIF type monitor flags $MONFLAGS || \
+    { echo "$PROG: cannot create $MONIF on $PHY" >&2; exit 1; }
+ip link set $MONIF up || exit 1
+
+if [ "$CHAN" = 0 ]
+then
+    echo "$PROG: $MONIF on $PHY ($BASEIF), hopping channels - frames will be missed" >&2
+    while :
+    do
+        for c in 1 6 11 2 3 4 5 7 8 9 10 12 13
+        do
+            iw dev $MONIF set channel $c 2>/dev/null
+            sleep 1
+        done
+    done &
+    HOPPID=$!
+else
+    iw dev $MONIF set channel $CHAN || exit 1
+    echo "$PROG: $MONIF on $PHY ($BASEIF), channel $CHAN" >&2
+fi
+
+#
+# category 0x7f + OUI 18:fe:34 at the top of the action body. libpcap resolves wlan[]
+# past the variable length radiotap header for us, and `subtype action` is not a keyword
+#
+FILTER='wlan[0] == 0xd0 and wlan[24:4] == 0x7f18fe34'
+[ $ALL -eq 1 ] && FILTER='wlan[0] == 0xd0'
+
+set -- -i $MONIF -s 0 -U -w -
+[ -n "$COUNT" ] && set -- "$@" -c $COUNT
+set -- tcpdump "$@" "$FILTER"
+[ -n "$SECS" ] && set -- timeout $SECS "$@"
+
+if [ -n "$PCAP_OUT" ]
+then
+    "$@" 2> /dev/null \
+        | stdbuf -o0 tee "$PCAP_OUT" \
+        | stdbuf -o0 od -An -tx1 -v \
+        | gawk -f $AWKF $AWKARGS
+else
+    "$@" 2> /dev/null \
+        | stdbuf -o0 od -An -tx1 -v \
+        | gawk -f $AWKF $AWKARGS
+fi
