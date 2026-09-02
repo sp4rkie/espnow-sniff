@@ -182,8 +182,14 @@ func drain(   caplen, tot, i)
                 exit 1
             continue
         }
-        if (N - P < 16)
+        if (N - P < 24)                        # enough to tell a header from a record
             return
+        if (is_ghdr(P)) {                      # repeated header from a live stream
+            for (i = P; i < P + 24; i++)
+                delete B[i]
+            P += 24
+            continue
+        }
         caplen = p32(P + 8)
         if (caplen < 0 || caplen > 262144) {
             print "espnow-sniff: pcap stream out of sync" > "/dev/stderr"
@@ -199,6 +205,14 @@ func drain(   caplen, tot, i)
     }
 }
 
+func is_ghdr(o,   m)
+{
+    m = sprintf("%02x%02x%02x%02x", B[o], B[o+1], B[o+2], B[o+3])
+    if (m != "d4c3b2a1" && m != "a1b2c3d4" && m != "4d3cb2a1" && m != "a1b23c4d")
+        return 0
+    return p32(o + 20) == 127
+}
+
 func ghdr(   m, i)
 {
     m = sprintf("%02x%02x%02x%02x", B[P], B[P+1], B[P+2], B[P+3])
@@ -207,10 +221,23 @@ func ghdr(   m, i)
     else if (m == "4d3cb2a1") { LE = 1; NS = 1 }
     else if (m == "a1b23c4d") { LE = 0; NS = 1 }
     else {
-        printf("espnow-sniff: not a pcap stream (magic %s)\n", m) > "/dev/stderr"
+        #
+        # a serial source has boot chatter in front of the stream, so do not give up
+        # on the first bad byte - drop one and look again for the magic
+        #
+        delete B[P]
+        P++
+        if (++SKIPPED <= 65536)
+            return -1
+        print "espnow-sniff: no pcap header in the first 64k of input" > "/dev/stderr"
         return 0
     }
     if ((DLT = p32(P + 20)) != 127) {
+        if (SKIPPED) {                              # false magic while resynchronising
+            delete B[P]
+            P++
+            return -1
+        }
         printf("espnow-sniff: link type %d, need 127 (radiotap)\n", DLT) > "/dev/stderr"
         return 0
     }
@@ -414,7 +441,7 @@ AWKARGS="-v AWKF=$AWKF -v ALL=$ALL -v SHOWHEX=$HEX -v QUIET=$QUIET -v NAMES=$NAM
 if [ -n "$PCAP_IN" ]
 then
     [ -r "$PCAP_IN" ] || { echo "$PROG: cannot read $PCAP_IN" >&2; rm -f $AWKF; exit 1; }
-    od -An -tx1 -v < "$PCAP_IN" | gawk -f $AWKF $AWKARGS
+    stdbuf -o0 od -An -tx1 -v < "$PCAP_IN" | gawk -f $AWKF $AWKARGS
     exit $?
 fi
 
