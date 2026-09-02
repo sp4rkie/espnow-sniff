@@ -133,3 +133,7 @@ wlan[0] == 0xd0 and wlan[24:4] == 0x7f18fe34
 
 That is the action frame subtype, then the vendor specific category `0x7f` followed by
 Espressif's OUI `18:fe:34`.
+
+## License
+
+Released into the public domain under [The Unlicense](LICENSE). Do whatever you like with it.
