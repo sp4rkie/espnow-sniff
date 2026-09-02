@@ -377,8 +377,8 @@ END {
         printf("\n--- no ESP-NOW frames (%d frames examined, %d bad FCS) ---\n", TOTAL, BADFCS)
         exit
     }
-    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds, %d dropped for bad FCS ---\n", \
-           ESPNOW, length(CNT), T1 - T0, BADFCS)
+    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds; %d bad FCS, %d not decoded ---\n", \
+           ESPNOW, length(CNT), T1 - T0, BADFCS, TOTAL - ESPNOW - BADFCS)
     for (s in CNT)
         printf("  %-19s %6d  rssi %4s/%4s/%4s dBm  last: \"%s\"\n", \
             nm(s), CNT[s], \
