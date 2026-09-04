@@ -169,8 +169,21 @@ END {
             if ((k "|" n1) in seen && (k "|" n2) in seen) both2++
         if (both2) {
             est = caught[n1] * caught[n2] / both2
-            printf("\n  estimated transmissions on the air : %.0f (>= lower bound)\n", est)
-            printf("  the %d collectors between them caught: %.1f%% of that\n", nc, 100 * tot / est)
+            #
+            # the estimate counts only what the two best collectors disagreed about,
+            # so once they agree on nearly everything it drops to (or below) the union
+            # we already hold. that is not >100% coverage, it is the estimator running
+            # out of evidence: report it as saturated rather than printing a nonsense
+            # percentage
+            #
+            if (est <= tot)
+                printf("\n  the 2 best collectors disagree on too little to estimate a miss\n" \
+                       "  (%d transmissions held, estimator saturated at %.0f) - no evidence\n" \
+                       "  of anything on the air that all %d collectors missed\n", tot, est, nc)
+            else {
+                printf("\n  estimated transmissions on the air : %.0f (>= lower bound)\n", est)
+                printf("  the %d collectors between them caught: %.1f%% of that\n", nc, 100 * tot / est)
+            }
         }
     }
 
