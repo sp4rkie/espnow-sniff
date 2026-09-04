@@ -121,6 +121,51 @@ cannot hear itself, so what comes back is mac80211's TX feedback. You can tell: 
 carry no RSSI (the column shows `?`) and each appears twice. It still exercises the decoder
 against a real driver-produced radiotap header, which is a different layout from the receive one.
 
+## Several sniffers at once
+
+One receiver misses a few percent of frames, and which few depends on where it sits.
+Several cheap sniffers spread around and reporting to one machine cover far more
+between them. `espnow-collect` is the listener:
+
+```sh
+espnow-collect -d /var/lib/espnow &
+```
+
+Each sniffer connects and is appended to its own `espnow-<ip>.pcap`. Appending across
+reconnects is safe, because a sniffer re-emits the pcap global header every time it
+connects and the decoder skips headers repeated mid-stream. Any one file decodes on
+its own, live if you want it:
+
+```sh
+tail -c +1 -f /var/lib/espnow/espnow-10.0.0.5.pcap | espnow-sniff -r /dev/stdin
+```
+
+`espnow-merge` collapses them into one view:
+
+```
+--- 330 transmissions from 3 collector(s), 3248 frames after merge ---
+
+  COLLECTOR                  SEEN OF TOTAL
+  10.0.0.5                    312    94.5%
+  10.0.0.6                    301    91.2%
+
+  SEEN BY N COLLECTORS      COUNT    SHARE
+  1                            44    13.3%
+  2                           286    86.7%
+```
+
+Frames are grouped by `(source, sequence, frame id)`, the frame id being the 4 byte
+value ESP-NOW carries after the OUI. That value stays the same across the retries of
+one transmission and changes between transmissions, so it identifies a transmission
+**without the collectors needing agreeing clocks** — which matters, because retries
+are about a millisecond apart and byte-identical, finer than any clock protocol
+resolves over a LAN. The frame count reported is the **maximum** across collectors,
+not the sum: a collector that missed some retries must not drag the number down.
+
+Duplicates are merged rather than discarded, so each transmission keeps every
+collector's RSSI. The same frame seen from several points is a coverage map and a
+rough fix on where the transmitter was.
+
 ## Notes
 
 `subtype action` is not a libpcap keyword — it is a syntax error, not an empty filter. The

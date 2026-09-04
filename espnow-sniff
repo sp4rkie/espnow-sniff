@@ -34,6 +34,7 @@ COUNT=
 ALL=0
 HEX=0
 QUIET=0
+MACHINE=0
 KEEP=0
 FCSFAIL=0
 
@@ -52,6 +53,8 @@ usage: $PROG [options]
   -C COUNT   stop after COUNT frames
   -a         show every vendor action frame, not just ESP-NOW
   -x         hex dump the payload as well as the ASCII rendering
+  -M         machine readable: one tab separated line per frame, carrying the
+             frame identity, for feeding espnow-merge
   -q         no per frame lines, print the summary only
   -F         create the monitor with fcsfail, so CRC failed frames are delivered
              too (they are dropped in the driver otherwise, and never counted)
@@ -67,7 +70,7 @@ USAGE
     exit 1
 }
 
-while getopts c:i:m:n:r:w:t:C:axqkFh OPT
+while getopts c:i:m:n:r:w:t:C:axqkFMh OPT
 do
     case $OPT in
     c)  CHAN=$OPTARG ;;
@@ -80,6 +83,7 @@ do
     C)  COUNT=$OPTARG ;;
     a)  ALL=1 ;;
     x)  HEX=1 ;;
+    M)  MACHINE=1 ;;
     q)  QUIET=1 ;;
     F)  FCSFAIL=1 ;;
     k)  KEEP=1 ;;
@@ -161,7 +165,7 @@ BEGIN {
     load_names()
     P = N = 0
 
-    if (!QUIET)
+    if (!QUIET && !MACHINE)
         printf("%-15s %-4s %6s %6s %6s %-3s %3s  %-19s %-19s %4s  %s\n", \
                "TIME", "CH", "RSSI", "RATE", "SEQ", "RTY", "VER", "SOURCE", "DEST", "LEN", "PAYLOAD")
 }
@@ -365,6 +369,21 @@ func pkt(o, caplen, ts, tsf, \
 
     LASTP[sa] = ascii(plen)
 
+    #
+    # machine mode: stable tab separated fields, and the 4 byte value ESP-NOW puts
+    # after the OUI, which is constant across the retries of one transmission and
+    # so identifies it to a merge across several collectors
+    #
+    if (MACHINE) {
+        printf("%d.%06d\t%s\t%d\t%s\t%s\t%s\t%s\t%02x%02x%02x%02x\t%d\t%s\n", \
+            ts, (NS ? int(tsf / 1000) : tsf), \
+            (rssi == 999 ? "?" : rssi), seq, (rty == "" ? "-" : "R"), \
+            (ver < 0 ? "-" : ver), sa, da, B[b+4], B[b+5], B[b+6], B[b+7], \
+            plen, LASTP[sa])
+        fflush()
+        return
+    }
+
     if (QUIET)
         return
 
@@ -413,6 +432,9 @@ func hexdump(n,   i, j, h, a, c)
 }
 
 END {
+    if (MACHINE)                                 # a machine format gets no epilogue
+        exit
+
     if (!ESPNOW) {
         printf("\n--- no ESP-NOW frames (%d frames examined, %d bad FCS) ---\n", TOTAL, BADFCS)
         exit
@@ -446,7 +468,7 @@ END {
 }
 !
 
-AWKARGS="-v AWKF=$AWKF -v ALL=$ALL -v SHOWHEX=$HEX -v QUIET=$QUIET -v NAMES=$NAMES"
+AWKARGS="-v AWKF=$AWKF -v ALL=$ALL -v SHOWHEX=$HEX -v QUIET=$QUIET -v NAMES=$NAMES -v MACHINE=$MACHINE"
 
 #
 # offline: just re-decode a capture, no radio involved

@@ -1,0 +1,158 @@
+#!/bin/sh
+
+#
+# espnow-merge - collapse captures from several ESP-NOW collectors into one view
+#
+# Feed it the per source files espnow-collect wrote. Every collector that was in range
+# heard the same transmissions, so the same frame arrives several times; this reports each
+# transmission once, with what each collector made of it.
+#
+#   espnow-merge /var/lib/espnow/*.pcap
+#   espnow-merge -c /var/lib/espnow/*.pcap        # coverage summary only
+#
+# Frames are grouped by (source, sequence, frame id), where the frame id is the 4 byte value
+# ESP-NOW carries after the OUI. That value is constant across the retries of one
+# transmission and changes between transmissions, so it identifies a transmission without
+# needing the collectors' clocks to agree - which matters, because retries are ~1ms apart
+# and byte identical, far finer than any clock protocol resolves over a LAN.
+#
+# The frame count reported is the MAX across collectors, not the sum: a collector that
+# missed some retries must not drag the number down, and one that saw them all sets it.
+#
+
+PROG=`basename $0`
+COVER=0
+
+usage()
+{
+    cat >&2 << USAGE
+usage: $PROG [-c] <capture.pcap> ...
+
+  -c         coverage summary only, no per transmission lines
+  -h         this help
+
+  Labels come from the file names, so espnow-collect's espnow-<ip>.pcap files
+  identify themselves.
+USAGE
+    exit 1
+}
+
+while getopts ch OPT
+do
+    case $OPT in
+    c)  COVER=1 ;;
+    *)  usage ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+[ $# -ge 1 ] || usage
+
+: ${NAMES:=$HOME/.espnow-names}
+[ -r "$NAMES" ] || NAMES=
+command -v espnow-sniff > /dev/null || { echo "$PROG: espnow-sniff not found" >&2; exit 1; }
+
+TMP=`mktemp ${TMPDIR:-/tmp}/$PROG.XXXXXX` || exit 1
+trap 'rm -f $TMP' EXIT INT TERM HUP
+
+for f
+do
+    [ -r "$f" ] || { echo "$PROG: cannot read $f" >&2; exit 1; }
+    lbl=`basename "$f" | sed -e 's/^espnow-//' -e 's/\.pcap$//'`
+    espnow-sniff -M -r "$f" 2>/dev/null | sed "s/^/$lbl	/"
+done > $TMP
+
+gawk -F '\t' -v COVER=$COVER -v NAMES="$NAMES" '
+func nm(a)     { return (a in NAME) ? NAME[a] : a }
+
+BEGIN {
+    if (NAMES != "")
+        while ((getline line < NAMES) > 0) {
+            sub(/^[ \t]*#.*/, "", line)
+            if (split(line, f, " ") >= 2)          # FS is a tab here, names are space separated
+                NAME[tolower(f[1])] = f[2]
+        }
+}
+
+{
+    #
+    # label ts rssi seq rty ver sa da id len payload
+    #
+    if (NF != 11)                            # not a machine mode frame line
+        next
+
+    lbl = $1; ts = $2 + 0; rssi = $3; seq = $4; sa = $7; da = $8; id = $9; pl = $11
+
+    if (sa ~ /^02:00:00/)                       # a collector reporting its own health
+        next
+
+    k = sa "|" seq "|" id
+    if (!(k in first) || ts < first[k])
+        first[k] = ts
+    DA[k] = da
+    PL[k] = pl
+
+    n[k "|" lbl]++                              # frames this collector saw of this one
+    if (!((k "|" lbl) in seen)) {
+        seen[k "|" lbl] = 1
+        who[k] = who[k] (who[k] ? "," : "") lbl
+        nwho[k]++
+    }
+    if (rssi != "?") {
+        if (!((k "|" lbl) in rmax) || rssi + 0 > rmax[k "|" lbl]) rmax[k "|" lbl] = rssi + 0
+    }
+    COLL[lbl] = 1
+    if (n[k "|" lbl] > mx[k])
+        mx[k] = n[k "|" lbl]
+}
+
+END {
+    nc = 0
+    for (c in COLL) nc++
+
+    if (!COVER) {
+        printf("%-19s %-19s %-19s %6s %-9s %6s  %s\n", \
+               "TIME", "SOURCE", "DEST", "SEQ", "ID", "FRAMES", "COLLECTORS / PAYLOAD")
+        PROCINFO["sorted_in"] = "@val_num_asc"
+        for (k in first) {
+            split(k, a, "|")
+            det = ""
+            for (c in COLL)
+                if ((k "|" c) in seen)
+                    det = det sprintf("%s%s(%d,%s)", det ? " " : "", c, n[k "|" c], \
+                                      ((k "|" c) in rmax) ? rmax[k "|" c] "dBm" : "?")
+            printf("%-19s %-19s %-19s %6s %-9s %6d  %s  \"%s\"\n", \
+                   strftime("%H:%M:%S", int(first[k])) sprintf(".%06d", \
+                       int((first[k] - int(first[k])) * 1000000)), \
+                   nm(a[1]), nm(DA[k]), a[2], a[3], mx[k], det, PL[k])
+        }
+        printf("\n")
+    }
+
+    tot = 0
+    for (k in first) {
+        tot++
+        cov[nwho[k]]++
+        for (c in COLL)
+            if ((k "|" c) in seen) {
+                caught[c]++
+                gained[c] += n[k "|" c]
+            }
+        union_frames += mx[k]
+    }
+
+    printf("--- %d transmissions from %d collector(s), %d frames after merge ---\n\n", \
+           tot, nc, union_frames)
+
+    printf("  %-22s %8s %8s\n", "COLLECTOR", "SEEN", "OF TOTAL")
+    for (c in COLL)
+        printf("  %-22s %8d %7.1f%%\n", c, caught[c], 100 * caught[c] / tot)
+
+    printf("\n  %-22s %8s %8s\n", "SEEN BY N COLLECTORS", "COUNT", "SHARE")
+    for (i = 1; i <= nc; i++)
+        if (cov[i])
+            printf("  %-22d %8d %7.1f%%\n", i, cov[i], 100 * cov[i] / tot)
+    if (cov[0])
+        printf("  %-22s %8d\n", "(none - impossible)", cov[0])
+}
+' $TMP
