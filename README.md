@@ -166,6 +166,34 @@ Duplicates are merged rather than discarded, so each transmission keeps every
 collector's RSSI. The same frame seen from several points is a coverage map and a
 rough fix on where the transmitter was.
 
+### One percentage per collector will mislead you
+
+That summary is only honest while traffic is spread evenly over the collectors, and it
+usually is not. A single chatty transmitter parked next to one sniffer can be most of the
+traffic in the capture, and then the overall figures say little more than how far each
+collector sits from *that one device*. A collector can read 31% and contribute nothing
+unique, and still be the only thing in the building that hears its own room properly.
+
+So `-s` breaks it down per source:
+
+```
+  PER SOURCE - share of transmissions heard, by device and collector
+
+  SOURCE                  TOTAL          10.0.0.5          10.0.0.6          10.0.0.7
+  remote-1                 5584    0.0%    1 -92dBm   97.8% 5462 -64dBm   98.1% 5477 -56dBm
+  gateway-a                1367   89.5% 1223 -74dBm   96.9% 1325 -23dBm   71.0%  970 -67dBm
+  sensor-1                    2  100.0%    2 -43dBm  100.0%    2 -88dBm  100.0%    2 -83dBm
+
+  each cell: share of TOTAL heard, transmissions, best RSSI seen
+```
+
+`10.0.0.5` looks useless on `remote-1`, which happens to be two thirds of the whole
+capture — and it is the best receiver in the mesh for `sensor-1`, 40 dB ahead of the
+others. Judge a collector on the devices it is there to hear, not on the total.
+
+Periodic sensors make a far better test population than one driven remote, because they
+are already spread out the way the mesh is. They are also slow, so give it hours.
+
 ## Notes
 
 `subtype action` is not a libpcap keyword — it is a syntax error, not an empty filter. The
