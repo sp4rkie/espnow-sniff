@@ -191,9 +191,16 @@ func drain(   caplen, tot, i)
             continue
         }
         caplen = p32(P + 8)
+        #
+        # a live stream can be truncated mid record by a dropped connection. the
+        # source re-emits the global header, so hunt for it again rather than die
+        #
         if (caplen < 0 || caplen > 262144) {
-            print "espnow-sniff: pcap stream out of sync" > "/dev/stderr"
-            exit 1
+            delete B[P]
+            P++
+            GH = 0
+            RESYNCS++
+            continue
         }
         tot = 16 + caplen
         if (N - P < tot)
@@ -335,7 +342,13 @@ func pkt(o, caplen, ts, tsf, \
         return
 
     ESPNOW++
+    #
+    # a live source can have its clock corrected under us (SNTP landing mid stream),
+    # so restart the span at a jump rather than report a nonsense duration
+    #
     if (!T0) T0 = ts
+    if (TPREV && (ts - TPREV > 86400 || TPREV - ts > 86400)) T0 = ts
+    TPREV = ts
     T1 = ts
 
     CNT[sa]++
@@ -404,8 +417,8 @@ END {
         printf("\n--- no ESP-NOW frames (%d frames examined, %d bad FCS) ---\n", TOTAL, BADFCS)
         exit
     }
-    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds; %d bad FCS, %d not decoded ---\n", \
-           ESPNOW, length(CNT), T1 - T0, BADFCS, TOTAL - ESPNOW - BADFCS)
+    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds; %d bad FCS, %d not decoded, %d resync ---\n", \
+           ESPNOW, length(CNT), T1 - T0, BADFCS, TOTAL - ESPNOW - BADFCS, RESYNCS)
     for (s in CNT)
         printf("  %-19s %6d  rssi %4s/%4s/%4s dBm  last: \"%s\"\n", \
             nm(s), CNT[s], \
