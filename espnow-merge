@@ -152,6 +152,28 @@ END {
     for (i = 1; i <= nc; i++)
         if (cov[i])
             printf("  %-22d %8d %7.1f%%\n", i, cov[i], 100 * cov[i] / tot)
+    #
+    # with two observers the population can be estimated (Lincoln-Petersen):
+    # N ~= n1 * n2 / both. it assumes the two miss frames independently, which
+    # collectors in different rooms only roughly do - a transmission too weak for
+    # everyone is missed by both - so treat the result as a LOWER bound on what
+    # was really on the air, and the coverage figure as an upper bound
+    #
+    if (nc >= 2) {
+        n1 = n2 = ""
+        for (c in COLL)
+            if (n1 == "" || caught[c] > caught[n1]) { n2 = n1; n1 = c }
+            else if (n2 == "" || caught[c] > caught[n2]) n2 = c
+        both2 = 0
+        for (k in first)
+            if ((k "|" n1) in seen && (k "|" n2) in seen) both2++
+        if (both2) {
+            est = caught[n1] * caught[n2] / both2
+            printf("\n  estimated transmissions on the air : %.0f (>= lower bound)\n", est)
+            printf("  the %d collectors between them caught: %.1f%% of that\n", nc, 100 * tot / est)
+        }
+    }
+
     if (cov[0])
         printf("  %-22s %8d\n", "(none - impossible)", cov[0])
 }
