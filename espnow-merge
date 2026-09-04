@@ -93,14 +93,15 @@ BEGIN {
     k = sa "|" seq "|" id
     if (!(k in first) || ts < first[k])
         first[k] = ts
-    DA[k] = da
-    PL[k] = pl
     SRC[k] = sa
+    if (!COVER) {                               # only the per transmission listing needs these,
+        DA[k] = da                              # and they are the largest thing held per
+        PL[k] = pl                              # transmission - a long capture cannot afford them
+    }
 
     n[k "|" lbl]++                              # frames this collector saw of this one
     if (!((k "|" lbl) in seen)) {
         seen[k "|" lbl] = 1
-        who[k] = who[k] (who[k] ? "," : "") lbl
         nwho[k]++
     }
     if (rssi != "?") {
