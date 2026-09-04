@@ -9,6 +9,7 @@
 #
 #   espnow-merge /var/lib/espnow/*.pcap
 #   espnow-merge -c /var/lib/espnow/*.pcap        # coverage summary only
+#   espnow-merge -c -s /var/lib/espnow/*.pcap     # ... plus a per source matrix
 #
 # Frames are grouped by (source, sequence, frame id), where the frame id is the 4 byte value
 # ESP-NOW carries after the OUI. That value is constant across the retries of one
@@ -22,13 +23,15 @@
 
 PROG=`basename $0`
 COVER=0
+PERSRC=0
 
 usage()
 {
     cat >&2 << USAGE
-usage: $PROG [-c] <capture.pcap> ...
+usage: $PROG [-c] [-s] <capture.pcap> ...
 
   -c         coverage summary only, no per transmission lines
+  -s         add a per source matrix: what each collector heard of each device
   -h         this help
 
   Labels come from the file names, so espnow-collect's espnow-<ip>.pcap files
@@ -37,10 +40,11 @@ USAGE
     exit 1
 }
 
-while getopts ch OPT
+while getopts csh OPT
 do
     case $OPT in
     c)  COVER=1 ;;
+    s)  PERSRC=1 ;;
     *)  usage ;;
     esac
 done
@@ -62,7 +66,7 @@ do
     espnow-sniff -M -r "$f" 2>/dev/null | sed "s/^/$lbl	/"
 done > $TMP
 
-gawk -F '\t' -v COVER=$COVER -v NAMES="$NAMES" '
+gawk -F '\t' -v COVER=$COVER -v PERSRC=$PERSRC -v NAMES="$NAMES" '
 func nm(a)     { return (a in NAME) ? NAME[a] : a }
 
 BEGIN {
@@ -91,6 +95,7 @@ BEGIN {
         first[k] = ts
     DA[k] = da
     PL[k] = pl
+    SRC[k] = sa
 
     n[k "|" lbl]++                              # frames this collector saw of this one
     if (!((k "|" lbl) in seen)) {
@@ -189,5 +194,49 @@ END {
 
     if (cov[0])
         printf("  %-22s %8d\n", "(none - impossible)", cov[0])
+
+    #
+    # a single overall coverage figure hides the thing that actually matters for a mesh
+    # spread over rooms: a collector looks useless while the only busy transmitter sits at
+    # the far end of the house, and indispensable the moment something talks next to it.
+    # so break it down per source - one row per device, one column per collector
+    #
+    if (PERSRC) {
+        for (k in first) {
+            stot[SRC[k]]++
+            for (c in COLL)
+                if ((k "|" c) in seen) {
+                    sheard[SRC[k] "|" c]++
+                    if ((k "|" c) in rmax &&    # a TX feedback frame carries no dBm at all
+                        (!((SRC[k] "|" c) in sbest) ||
+                         rmax[k "|" c] + 0 > sbest[SRC[k] "|" c] + 0))
+                        sbest[SRC[k] "|" c] = rmax[k "|" c]
+                }
+        }
+        ncol = 0
+        PROCINFO["sorted_in"] = "@ind_str_asc"
+        for (c in COLL) col[++ncol] = c
+
+        printf("\n  PER SOURCE - share of transmissions heard, by device and collector\n\n")
+        printf("  %-21s %7s", "SOURCE", "TOTAL")
+        for (i = 1; i <= ncol; i++)
+            printf(" %17s", col[i])
+        printf("\n")
+
+        PROCINFO["sorted_in"] = "@val_num_desc"
+        for (sa in stot) {
+            printf("  %-21s %7d", substr(nm(sa), 1, 21), stot[sa])
+            for (i = 1; i <= ncol; i++) {
+                h = sheard[sa "|" col[i]] + 0
+                if (h)
+                    printf(" %6.1f%% %4d %5s", 100 * h / stot[sa], h, \
+                           ((sa "|" col[i]) in sbest) ? sbest[sa "|" col[i]] "dBm" : "?")
+                else
+                    printf(" %17s", "-")
+            }
+            printf("\n")
+        }
+        printf("\n  each cell: share of TOTAL heard, transmissions, best RSSI seen\n")
+    }
 }
 ' $TMP
