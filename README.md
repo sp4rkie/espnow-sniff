@@ -11,6 +11,10 @@ itself: radiotap, then the 802.11 header, then the action body and its vendor el
 14:23:01.482913 6      -47   1.0M   1827     2  remote-01           gateway-a     10  "R1 46 0 3"
 ```
 
+Want the sniffer itself to be an ESP32 rather than a PC with a WiFi adapter? That is
+[ultra-espnow-sniff](https://github.com/sp4rkie/ultra-espnow-sniff) — it emits the same pcap
+these tools read.
+
 ## What you need
 
 * **Monitor mode**, not promiscuous mode. Promiscuous mode is an Ethernet concept (and, confusingly,
@@ -125,7 +129,15 @@ against a real driver-produced radiotap header, which is a different layout from
 
 One receiver misses a few percent of frames, and which few depends on where it sits.
 Several cheap sniffers spread around and reporting to one machine cover far more
-between them. `espnow-collect` is the listener:
+between them.
+
+The cheap sniffer to spread around is an ESP32:
+[ultra-espnow-sniff](https://github.com/sp4rkie/ultra-espnow-sniff) puts one in promiscuous mode
+and streams this same pcap format over ethernet, so `espnow-collect` accepts it with nothing to
+translate. It is also the better receiver — an ESP32 and an AR9271 sniffing the same air one
+metre apart caught **99.6%** and **96.5%** of the union between them respectively.
+
+`espnow-collect` is the listener:
 
 ```sh
 espnow-collect -d /var/lib/espnow &
