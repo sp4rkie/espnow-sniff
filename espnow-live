@@ -1,0 +1,252 @@
+#!/bin/sh
+
+#
+# espnow-live - watch several ESP-NOW collectors at once, one line per transmission
+#
+# Every other live view decodes a single sniffer, which throws away the only thing a mesh
+# is for: when one collector is deaf to a device, another is not. This follows all of the
+# collector files at once and prints one line per transmission with a column per collector,
+# so a gap is visible as it happens rather than hours later in espnow-merge.
+#
+#   espnow-live /var/lib/espnow/*.pcap
+#   espnow-live -w 400 /var/lib/espnow/*.pcap      # hold longer before printing
+#   espnow-live -a /var/lib/espnow/*.pcap          # replay the files first, then follow
+#
+# By default each file is joined at its END, so what you see is what is happening now - a
+# long capture would otherwise spend minutes replaying itself before catching up. That works
+# because a sniffer re-emits the pcap global header every few seconds precisely so a reader
+# can join a stream in progress, and the decoder resyncs on it.
+#
+# Transmissions are grouped by (source, sequence, frame id), the same key espnow-merge uses,
+# which needs no agreement between the collectors' clocks.
+#
+# Unlike a batch merge, a live one cannot know when a transmission is finished, so each is
+# held briefly after it is first seen and then printed with whoever reported it in that
+# window. The hold is measured in ticks from a ticker process rather than from any clock in
+# the data, so collector clock skew cannot affect it. A collector that is merely slow will
+# show as a miss - keep the hold comfortably above the spread you see between collectors,
+# and remember retries of one transmission span tens of milliseconds by themselves.
+#
+
+PROG=`basename $0`
+HOLD=300                                # ms to wait before printing a transmission
+TICK=100                                # ms per tick
+SUMMARY=60                              # seconds between the rolling tally lines
+FROM=0                                  # -c argument for tail: 0 = EOF, +1 = whole file
+
+usage()
+{
+    cat >&2 << USAGE
+usage: $PROG [-w MS] [-s SECS] <capture.pcap> ...
+
+  -w MS      hold each transmission this long before printing it   [$HOLD]
+  -s SECS    seconds between rolling tally lines (0 = none)        [$SUMMARY]
+  -a         replay each file from the start first, then follow it
+  -h         this help
+
+  Point it at the files espnow-collect is writing, while it is writing them.
+  Column headers are the last octet of each collector's address.
+USAGE
+    exit 1
+}
+
+while getopts w:s:ah OPT
+do
+    case $OPT in
+    w)  HOLD=$OPTARG ;;
+    s)  SUMMARY=$OPTARG ;;
+    a)  FROM=+1 ;;
+    *)  usage ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+
+[ $# -ge 1 ] || usage
+
+#
+# an explicit NAMES that cannot be read is a typo, not a request for raw MACs - say so,
+# the way espnow-sniff does. only the default is allowed to be silently absent
+#
+if [ -n "$NAMES" ]
+then
+    [ -r "$NAMES" ] || { echo "$PROG: cannot read $NAMES" >&2; exit 1; }
+else
+    NAMES=$HOME/.espnow-names
+    [ -r "$NAMES" ] || NAMES=
+fi
+command -v espnow-sniff > /dev/null || { echo "$PROG: espnow-sniff not found" >&2; exit 1; }
+
+#
+# labels double as column headers, so keep them short: the last octet of the address
+# espnow-collect put in the file name
+#
+LBLS=
+for f
+do
+    LBLS="$LBLS `basename \"$f\" | sed -e 's/^espnow-//' -e 's/\.pcap$//' -e 's/.*\.//'`"
+done
+
+#
+# every feeder and the ticker write into the same pipe. the ticker is what lets the merger
+# age entries out while no frames are arriving - gawk is otherwise blocked on read and
+# would sit on a finished transmission until the next frame from anyone.
+#
+# the feeders are killed by PID from inside this subshell, never with `kill 0`: this may be
+# running down an ssh pipe, where the process group holds things that are not ours
+#
+{
+    PIDS=
+    for f
+    do
+        lbl=`basename "$f" | sed -e 's/^espnow-//' -e 's/\.pcap$//' -e 's/.*\.//'`
+        #
+        # stdbuf on the sed is not optional: writing to a pipe it block buffers, so on a
+        # quiet channel its 4K never fills and the merger sees nothing at all. busy traffic
+        # hides this completely, which is what makes it worth a comment
+        #
+        tail -c $FROM -F "$f" 2>/dev/null \
+            | espnow-sniff -M -r /dev/stdin 2>/dev/null \
+            | stdbuf -o0 sed "s/^/$lbl	/" &
+        PIDS="$PIDS $!"
+    done
+
+    NAP=`echo $TICK | gawk '{printf "%.3f", $1 / 1000}'`
+    while :
+    do
+        echo T
+        sleep $NAP
+    done &
+    PIDS="$PIDS $!"
+
+    trap 'kill $PIDS 2>/dev/null' EXIT INT TERM HUP
+    wait
+} | gawk -F '\t' -v NAMES="$NAMES" -v LBLS="$LBLS" -v HOLD=$HOLD -v TICK=$TICK -v SUMMARY=$SUMMARY '
+func nm(a)      { return (a in NAME) ? NAME[a] : a }
+func nmw(a, w)  { return substr(nm(a), 1, w) }
+
+BEGIN {
+    CONVFMT = "%.17g"                           # never let a timestamp become 1.78e+09
+    if (NAMES != "")
+        while ((getline line < NAMES) > 0) {
+            sub(/^[ \t]*#.*/, "", line)
+            if (split(line, f, " ") >= 2)       # FS is a tab here, the names file is not
+                NAME[tolower(f[1])] = f[2]
+        }
+    close(NAMES)
+
+    nc = split(LBLS, col, " ")
+    hold_ticks = HOLD / TICK
+    if (hold_ticks < 1)
+        hold_ticks = 1
+
+    printf("%-15s %-19s %-19s %6s %6s", "TIME", "SOURCE", "DEST", "SEQ", "FRAMES")
+    for (i = 1; i <= nc; i++)
+        printf(" %5s", col[i])
+    printf("  PAYLOAD\n")
+    fflush()
+}
+
+/^T$/ {                                         # a tick: age the oldest entries out
+    tick++
+    flush_ready()
+    #
+    # the tally has to come out as we go. gawk runs END on EOF, and a live view ends by
+    # Ctrl-C or a kill, neither of which gets there - so an END-only summary is a summary
+    # nobody ever sees. this one covers the interval just gone, not all time, because on a
+    # live display what matters is whether a collector is deaf NOW
+    #
+    if (SUMMARY > 0 && win && tick % int(SUMMARY * 1000 / TICK) == 0) {
+        printf("--- last %ds: %d transmissions", SUMMARY, win)
+        for (i = 1; i <= nc; i++)
+            printf(", %s missed %d (%.0f%%)", col[i], wmiss[col[i]] + 0, \
+                   100 * (wmiss[col[i]] + 0) / win)
+        printf("\n")
+        fflush()
+        win = 0
+        for (i = 1; i <= nc; i++)
+            wmiss[col[i]] = 0
+    }
+    next
+}
+
+NF != 11 { next }                               # not a machine mode frame line
+
+{
+    lbl = $1; ts = $2 + 0; rssi = $3; seq = $4; sa = $7; da = $8; id = $9; pl = $11
+
+    if (sa ~ /^02:00:00/)                       # a collector reporting its own health:
+        next                                    # only ever heard by itself, so it would
+                                                # read as a coverage failure every time
+    k = sa "|" seq "|" id
+    if (!(k in born)) {
+        born[k] = tick
+        ord[++last] = k                         # printed in arrival order, not hash order
+        TS[k] = ts; SA[k] = sa; DA[k] = da; SEQ[k] = seq
+    }
+    PL[k] = pl                                  # a retry may carry the payload the first
+                                                # frame was missing
+    n[k "|" lbl]++
+    if (n[k "|" lbl] > mx[k])
+        mx[k] = n[k "|" lbl]
+    if (rssi != "?" && (!((k "|" lbl) in r) || rssi + 0 > r[k "|" lbl]))
+        r[k "|" lbl] = rssi + 0
+}
+
+func flush_ready(   i, k, c, miss)
+{
+    while (first < last) {                      # ord is 1..last, so first+1 must be <= last
+        k = ord[first + 1]
+        if (tick - born[k] < hold_ticks)
+            break                               # arrival order is hold order, so the rest
+        first++                                 # are younger still - stop here
+        delete ord[first]
+
+        printf("%-15s %-19s %-19s %6s %6d", \
+               strftime("%H:%M:%S", int(TS[k])) sprintf(".%03d", (TS[k] - int(TS[k])) * 1000), \
+               nmw(SA[k], 19), nmw(DA[k], 19), SEQ[k], mx[k])
+
+        miss = 0
+        for (i = 1; i <= nc; i++) {
+            c = col[i]
+            if ((k "|" c) in n)
+                printf(" %5d", ((k "|" c) in r) ? r[k "|" c] : 0)
+            else {
+                printf(" %5s", "-")             # this collector was deaf to it
+                miss++
+            }
+        }
+        printf("  \"%s\"\n", PL[k])
+        fflush()
+
+        seen_by[nc - miss]++
+        total++
+        win++
+        if (miss)
+            for (i = 1; i <= nc; i++)
+                if (!((k "|" col[i]) in n)) {
+                    missed[col[i]]++
+                    wmiss[col[i]]++
+                }
+
+        delete born[k]; delete TS[k]; delete SA[k]; delete DA[k]
+        delete SEQ[k]; delete PL[k]; delete mx[k]
+        for (i = 1; i <= nc; i++) {
+            delete n[k "|" col[i]]
+            delete r[k "|" col[i]]
+        }
+    }
+}
+
+END {
+    if (!total)
+        exit
+    printf("\n--- %d transmissions", total)
+    for (i = nc; i >= 1; i--)
+        if (seen_by[i])
+            printf("; %d heard by %d of %d", seen_by[i], i, nc)
+    printf("\n")
+    for (i = 1; i <= nc; i++)
+        printf("  %-6s missed %d (%.1f%%)\n", col[i], missed[col[i]] + 0, \
+               100 * (missed[col[i]] + 0) / total)
+}
+'

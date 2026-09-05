@@ -194,6 +194,36 @@ others. Judge a collector on the devices it is there to hear, not on the total.
 Periodic sensors make a far better test population than one driven remote, because they
 are already spread out the way the mesh is. They are also slow, so give it hours.
 
+### Watching all the collectors at once, live
+
+Following one collector's file shows one collector's blind spots as if they were the truth,
+which is the opposite of why there is a mesh. `espnow-live` follows all of them together and
+prints one line per transmission with a column per collector:
+
+```
+TIME            SOURCE              DEST                   SEQ FRAMES    56    62    86  PAYLOAD
+08:39:19.453    sensor-1            gateway-a                0      1   -62   -88     -  "@temp@..."
+08:42:20.622    sensor-2            gateway-a                0      2   -75     -   -55  "@temp@..."
+08:45:52.837    remote-1            gateway-b                3     32   -84   -42   -62  "2B ^localhost ^86S ^"
+--- last 60s: 74 transmissions, 56 missed 12 (16%), 62 missed 9 (12%), 86 missed 9 (12%)
+```
+
+A `-` is a collector that never heard that transmission. `FRAMES` is the highest count any one
+of them saw, so 32 is a transmission that exhausted its retries — the destination never
+acknowledged it.
+
+Each file is joined at its **end** by default, so you see what is happening now rather than
+waiting for a long capture to replay; `-a` replays from the start instead. Joining a stream in
+progress works because a sniffer re-emits the pcap global header every few seconds for exactly
+that purpose.
+
+A live merge cannot know when a transmission is over, so each is held briefly (`-w`, 300 ms
+default) and then printed with whoever reported it in that window — a collector that is merely
+slow will show as a miss. The hold is counted in ticks from a ticker process, never from
+timestamps in the data, so clock skew between collectors cannot affect it. The tally line
+repeats every `-s` seconds (60 by default) because a live view ends with Ctrl-C, which never
+reaches an `END` block.
+
 ## Notes
 
 `subtype action` is not a libpcap keyword — it is a syntax error, not an empty filter. The
