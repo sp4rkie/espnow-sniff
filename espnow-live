@@ -91,11 +91,18 @@ done
 # age entries out while no frames are arriving - gawk is otherwise blocked on read and
 # would sit on a finished transmission until the next frame from anyone.
 #
-# the feeders are killed by PID from inside this subshell, never with `kill 0`: this may be
-# running down an ssh pipe, where the process group holds things that are not ours
+# cleaning up has two traps of its own. `$!` after a backgrounded pipeline names only its LAST
+# member, so killing by $! took out each sed and left tail and espnow-sniff running. and a
+# non-interactive sh starts background jobs with SIGINT ignored, so the very Ctrl-C that ends a
+# live view never reaches them. so kill every child of this subshell by parent pid, with
+# SIGTERM - found through /proc/self, since in here $$ is still the script's pid. tail is the one
+# that matters: everything downstream of it dies of EOF. and never `kill 0` - down an ssh pipe
+# the process group holds things that are not ours
 #
 {
-    PIDS=
+    read -r SELF _ < /proc/self/stat
+    trap 'pkill -TERM -P $SELF 2>/dev/null' EXIT INT TERM HUP       # before anything is forked
+
     for f
     do
         lbl=`basename "$f" | sed -e 's/^espnow-//' -e 's/\.pcap$//' -e 's/.*\.//'`
@@ -107,7 +114,6 @@ done
         tail -c $FROM -F "$f" 2>/dev/null \
             | espnow-sniff -M -r /dev/stdin 2>/dev/null \
             | stdbuf -o0 sed "s/^/$lbl	/" &
-        PIDS="$PIDS $!"
     done
 
     NAP=`echo $TICK | gawk '{printf "%.3f", $1 / 1000}'`
@@ -116,9 +122,7 @@ done
         echo T
         sleep $NAP
     done &
-    PIDS="$PIDS $!"
 
-    trap 'kill $PIDS 2>/dev/null' EXIT INT TERM HUP
     wait
 } | gawk -F '\t' -v NAMES="$NAMES" -v LBLS="$LBLS" -v HOLD=$HOLD -v TICK=$TICK -v SUMMARY=$SUMMARY '
 func nm(a)      { return (a in NAME) ? NAME[a] : a }
