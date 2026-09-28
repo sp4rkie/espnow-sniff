@@ -473,10 +473,27 @@ AWKARGS="-v AWKF=$AWKF -v ALL=$ALL -v SHOWHEX=$HEX -v QUIET=$QUIET -v NAMES=$NAM
 #
 # offline: just re-decode a capture, no radio involved
 #
+#
+# od prints whole 16-byte lines and holds a partial one back until more input arrives - which on
+# a file is never a problem, EOF flushes it, but on a live stream it strands the tail of each
+# record until the NEXT record pushes it out. on a quiet channel that is the next health frame,
+# up to 10 s later, so the last frame of every burst is shown late, and espnow-live, whose
+# collectors each release it at a different moment, splits one transmission into several
+# lines. -w1 makes every byte a complete line, so nothing can be held. it costs 2.4x in decode
+# speed (852 -> 349 KB/s on a Raspberry Pi 5), which live traffic never comes near but a batch
+# run over a 35 MB capture would feel - so a regular file keeps the full width
+#
+LIVEOD="od -An -tx1 -v -w1"
+
 if [ -n "$PCAP_IN" ]
 then
     [ -r "$PCAP_IN" ] || { echo "$PROG: cannot read $PCAP_IN" >&2; rm -f $AWKF; exit 1; }
-    stdbuf -o0 od -An -tx1 -v < "$PCAP_IN" | gawk -f $AWKF $AWKARGS
+    if [ -f "$PCAP_IN" ]                        # true for /dev/stdin redirected from a file too
+    then
+        stdbuf -o0 od -An -tx1 -v < "$PCAP_IN" | gawk -f $AWKF $AWKARGS
+    else
+        stdbuf -o0 $LIVEOD < "$PCAP_IN" | gawk -f $AWKF $AWKARGS
+    fi
     exit $?
 fi
 
@@ -565,10 +582,10 @@ if [ -n "$PCAP_OUT" ]
 then
     "$@" 2> /dev/null \
         | stdbuf -o0 tee "$PCAP_OUT" \
-        | stdbuf -o0 od -An -tx1 -v \
+        | stdbuf -o0 $LIVEOD \
         | gawk -f $AWKF $AWKARGS
 else
     "$@" 2> /dev/null \
-        | stdbuf -o0 od -An -tx1 -v \
+        | stdbuf -o0 $LIVEOD \
         | gawk -f $AWKF $AWKARGS
 fi
