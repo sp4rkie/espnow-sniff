@@ -145,8 +145,14 @@ espnow-collect -d /var/lib/espnow &
 
 Each sniffer connects and is appended to its own `espnow-<ip>.pcap`. Appending across
 reconnects is safe, because a sniffer re-emits the pcap global header every time it
-connects and the decoder skips headers repeated mid-stream. Any one file decodes on
-its own, live if you want it:
+connects and the decoder skips headers repeated mid-stream.
+
+A sniffer that reboots never closes its old connection, so the collector drops any source
+that has sent nothing for 60 seconds (`-t`, `0` to never). That is safe to do because a live
+sniffer is never silent: it sends a health frame every 10 seconds whatever the channel is
+doing. Without it every reboot leaves a dead connection behind, and they add up.
+
+Any one file decodes on its own, live if you want it:
 
 ```sh
 tail -c +1 -f /var/lib/espnow/espnow-10.0.0.5.pcap | espnow-sniff -r /dev/stdin
