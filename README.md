@@ -237,7 +237,9 @@ few retries no collector caught.
 
 `REPLY` is what tells you whether a destination actually got a transmission: `yes` or `no` on a
 request, `re` on an answer. Anything from B to A that starts within 200 ms (`-R`) of A's
-transmission to B counts as its reply. The frame count cannot tell you this either way — a
+transmission to B counts as its reply. An answer whose request no collector heard is marked
+`re?` — the command existed and reached its destination, but every collector missed it, which is
+otherwise easy to mistake for an answer out of nowhere. The frame count cannot tell you this either way — a
 destination can receive a transmission and lose its acknowledgement on the way back, so that the
 sender retries to the limit although it got through.
 

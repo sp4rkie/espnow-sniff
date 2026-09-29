@@ -23,10 +23,11 @@
 #
 # Each line also says whether it was answered: a transmission from B to A starting within -R ms
 # of one from A to B is taken as its reply, and REPLY reads "yes" or "no" on the request and "re"
-# on the answer. That is the test of whether a destination got something, and FRAMES is not. It
-# is the most any one collector saw, so only a lower bound on what was sent, and a destination
-# can take a transmission and lose its acknowledgement on the way back, so that the sender
-# retries to the limit all the same.
+# on the answer - "re?" when no collector heard the request it answers, so a line that looks
+# like an answer out of nowhere says that its command existed but was missed. That is the test
+# of whether a destination got something, and FRAMES is not. It is the most any one collector
+# saw, so only a lower bound on what was sent, and a destination can take a transmission and
+# lose its acknowledgement on the way back, so that the sender retries to the limit all the same.
 #
 # Unlike a batch merge, a live one cannot know when a transmission is finished, so each is
 # held briefly after it is first seen and then printed with whoever reported it in that
@@ -57,7 +58,8 @@ usage: $PROG [-w MS] [-R MS] [-s SECS] [-a] <capture.pcap> ...
 
   Point it at the files espnow-collect is writing, while it is writing them.
   Column headers are the last octet of each collector's address.
-  REPLY: yes/no = did the destination answer it, re = it is an answer.
+  REPLY: yes/no = did the destination answer it, re = it is an answer,
+         re? = an answer to something no collector heard.
 USAGE
     exit 1
 }
@@ -350,7 +352,7 @@ func asks(d)    { return rq[d] >= 3 && rq[d] >= 4 * re[d] }
 func reply_mark(k,   d, rv, m, L, i, q, t, best, bt)
 {
     if (k in ISRE)
-        return "re"
+        return (k in ORPH) ? "re?" : "re"
     if (k in ANS)
         return "yes"
     if (DA[k] ~ /^.[13579bdf]/)                 # group addressed: nobody in particular to answer
@@ -381,9 +383,9 @@ func reply_mark(k,   d, rv, m, L, i, q, t, best, bt)
             return "re"
         }
         if (answers(d)) {                       # to a request nobody heard - or nobody yet:
-            ISRE[k] = ORPH[k] = 1               # a slower collector may still bring it in
-            return "re"
-        }
+            ISRE[k] = ORPH[k] = 1               # a slower collector may still bring it in.
+            return "re?"                        # printed now, it says what was known now: the
+        }                                       # command existed, the collectors missed it
     }
     #
     # did its destination answer it?
