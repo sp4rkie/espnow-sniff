@@ -248,10 +248,12 @@ heard. Which direction carries the answers is learned as it goes, since timing a
 when a request went unheard: its answer would pass for a request, and the next transmission of
 the device, often well inside the window, for the answer to that.
 
-Each file is joined at its **end** by default, so you see what is happening now rather than
-waiting for a long capture to replay; `-a` replays from the start instead. Joining a stream in
-progress works because a sniffer re-emits the pcap global header every few seconds for exactly
-that purpose.
+Each file is joined at its **last pcap global header** by default — a sniffer re-emits one
+every 10 seconds for exactly that purpose — so you see what is happening now, with every column
+live from the first second, and the little that brings along from before the start is dropped
+rather than printed; `-a` replays the whole capture instead. Joining at the very end would leave
+each column blind until its sniffer next sent a header: long enough to miss an answer and print
+a false `no`.
 
 A live merge cannot know when a transmission is over, so each is held briefly (`-w`, 400 ms
 default) and then printed with whoever reported it in that window — a collector that is merely

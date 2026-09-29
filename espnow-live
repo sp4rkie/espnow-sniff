@@ -12,10 +12,11 @@
 #   espnow-live -w 600 /var/lib/espnow/*.pcap      # hold longer before printing
 #   espnow-live -a /var/lib/espnow/*.pcap          # replay the files first, then follow
 #
-# By default each file is joined at its END, so what you see is what is happening now - a
-# long capture would otherwise spend minutes replaying itself before catching up. That works
-# because a sniffer re-emits the pcap global header every few seconds precisely so a reader
-# can join a stream in progress, and the decoder resyncs on it.
+# By default each file is joined at its LAST pcap global header, which a sniffer re-emits
+# every 10 seconds precisely so a reader can join a stream in progress, and the little it
+# carries from before the start is dropped rather than printed - so what you see is what is
+# happening now, and every column is live from the first second. A long capture would
+# otherwise spend minutes replaying itself before catching up.
 #
 # Transmissions are grouped by (source, sequence, frame id), the same key espnow-merge uses,
 # which needs no agreement between the collectors' clocks.
@@ -40,7 +41,8 @@ HOLD=400                                # ms to wait before printing a transmiss
 REPLY=200                               # ms within which an answer counts as the reply
 TICK=100                                # ms per tick
 SUMMARY=60                              # seconds between the rolling tally lines
-FROM=0                                  # -c argument for tail: 0 = EOF, +1 = whole file
+FROM=0                                  # -c argument for tail: 0 = last header, +1 = whole file
+SCAN=262144                             # bytes at the end of a file searched for that header
 
 usage()
 {
@@ -100,6 +102,49 @@ fi
 command -v espnow-sniff > /dev/null || { echo "$PROG: espnow-sniff not found" >&2; exit 1; }
 
 #
+# where to join a file that is still being written. its very end is no good: the decoder can
+# only start at a pcap global header, which a sniffer re-emits every 10 s, so each column stayed
+# blind for up to that long - enough to miss an answer and print a false "no" - and a busy
+# sniffer can write more than the 64K the decoder searches before it gives up on the stream for
+# good. so join at the LAST header in the file, looked for in its final SCAN bytes: over a day of
+# four sniffers they were at most 155K apart. a candidate counts only with the right link type
+# after it, because the decoder stops dead on a false one. a file with no header that recent
+# is joined at its end after all, and syncs on its next one
+#
+joinat()
+{
+    size=`stat -c %s "$1" 2>/dev/null` || { echo 0; return; }
+    skip=0
+    [ $size -gt $SCAN ] && skip=`expr $size - $SCAN`
+    tail -c +`expr $skip + 1` "$1" 2>/dev/null | head -c `expr $size - $skip` \
+        | LC_ALL=C gawk -v skip=$skip '
+            BEGIN {
+                RS = "\xd4\xc3\xb2\xa1|\x4d\x3c\xb2\xa1|\xa1\xb2\xc3\xd4|\xa1\xb2\x3c\x4d"
+                le = "\x7f\x00\x00\x00"         # link type 127, radiotap, 16 bytes past the
+                be = "\x00\x00\x00\x7f"         # magic, in the byte order the magic gives
+            }
+            {
+                if (cand != "" && substr($0, 17, 4) == want)
+                    last = cand
+                at += length($0)
+                cand = ""
+                if (RT != "") {
+                    cand = at
+                    want = (substr(RT, 1, 1) == "\xa1") ? be : le
+                    at += length(RT)
+                }
+            }
+            END { print (last == "") ? 0 : "+" (skip + last + 1) }'
+}
+#
+# and what that header brings along from before the start is dropped by timestamp - but only
+# while the feeders catch up. later on, a sniffer that reboots stamps its frames with its uptime,
+# dates in 1970, until its clock has synced, and those frames are live
+#
+SINCE=0
+[ "$FROM" = 0 ] && SINCE=`date +%s.%N`
+
+#
 # labels double as column headers, so keep them short: the last octet of the address
 # espnow-collect put in the file name
 #
@@ -138,9 +183,13 @@ done
         # and both come out malformed and are dropped. three feeders racing lost 77% of their
         # lines that way. a print and a flush is one write, and a pipe keeps those whole
         #
-        tail -c $FROM -F "$f" 2>/dev/null \
+        from=$FROM
+        [ "$FROM" = 0 ] && from=`joinat "$f"`
+        tail -c $from -F "$f" 2>/dev/null \
             | espnow-sniff -M -r /dev/stdin 2>/dev/null \
-            | gawk -v l="$lbl" '{ print l "\t" $0; fflush() }' &
+            | gawk -v l="$lbl" -v since=$SINCE '
+                BEGIN { stop = systime() + 5 }
+                $1 >= since || systime() > stop { print l "\t" $0; fflush() }' &
     done
 
     NAP=`echo $TICK | gawk '{printf "%.3f", $1 / 1000}'`
