@@ -57,13 +57,19 @@ shift `expr $OPTIND - 1`
 command -v espnow-sniff > /dev/null || { echo "$PROG: espnow-sniff not found" >&2; exit 1; }
 
 TMP=`mktemp ${TMPDIR:-/tmp}/$PROG.XXXXXX` || exit 1
-trap 'rm -f $TMP' EXIT INT TERM HUP
+trap 'rm -f $TMP $TMP.err' EXIT INT TERM HUP
 
+#
+# the decoder writes to stderr only when it has to stop, so a message there means that
+# file ends early in everything below - say so, and which file, rather than let a short
+# report pass for a complete one
+#
 for f
 do
     [ -r "$f" ] || { echo "$PROG: cannot read $f" >&2; exit 1; }
     lbl=`basename "$f" | sed -e 's/^espnow-//' -e 's/\.pcap$//'`
-    espnow-sniff -M -r "$f" 2>/dev/null | sed "s/^/$lbl	/"
+    espnow-sniff -M -r "$f" 2> $TMP.err | sed "s/^/$lbl	/"
+    [ -s $TMP.err ] && sed "s|^|$PROG: $f: |" $TMP.err >&2
 done > $TMP
 
 gawk -F '\t' -v COVER=$COVER -v PERSRC=$PERSRC -v NAMES="$NAMES" '

@@ -185,8 +185,17 @@ done
         #
         from=$FROM
         [ "$FROM" = 0 ] && from=`joinat "$f"`
+        #
+        # the decoder writes to stderr only when it has to stop, and then that column is dead
+        # for the rest of the session - so its reason goes to the terminal with the file it
+        # was reading, instead of vanishing. fd 3 carries the frames past the relabelling.
+        # the flush again is not optional: a dead decoder leaves od behind it waiting on
+        # tail, so the relabeller never sees EOF, and a buffered message would sit there
+        # until the Ctrl-C that kills it unwritten
+        #
         tail -c $from -F "$f" 2>/dev/null \
-            | espnow-sniff -M -r /dev/stdin 2>/dev/null \
+            | { espnow-sniff -M -r /dev/stdin 2>&1 >&3 \
+                | gawk -v p="$PROG: $f: " '{ print p $0; fflush() }' >&2; } 3>&1 \
             | gawk -v l="$lbl" -v since=$SINCE '
                 BEGIN { stop = systime() + 5 }
                 $1 >= since || systime() > stop { print l "\t" $0; fflush() }' &
