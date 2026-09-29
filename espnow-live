@@ -9,7 +9,7 @@
 # so a gap is visible as it happens rather than hours later in espnow-merge.
 #
 #   espnow-live /var/lib/espnow/*.pcap
-#   espnow-live -w 400 /var/lib/espnow/*.pcap      # hold longer before printing
+#   espnow-live -w 600 /var/lib/espnow/*.pcap      # hold longer before printing
 #   espnow-live -a /var/lib/espnow/*.pcap          # replay the files first, then follow
 #
 # By default each file is joined at its END, so what you see is what is happening now - a
@@ -20,6 +20,13 @@
 # Transmissions are grouped by (source, sequence, frame id), the same key espnow-merge uses,
 # which needs no agreement between the collectors' clocks.
 #
+# Each line also says whether it was answered: a transmission from B to A starting within -R ms
+# of one from A to B is taken as its reply, and REPLY reads "yes" or "no" on the request and "re"
+# on the answer. That is the test of whether a destination got something, and FRAMES is not. It
+# is the most any one collector saw, so only a lower bound on what was sent, and a destination
+# can take a transmission and lose its acknowledgement on the way back, so that the sender
+# retries to the limit all the same.
+#
 # Unlike a batch merge, a live one cannot know when a transmission is finished, so each is
 # held briefly after it is first seen and then printed with whoever reported it in that
 # window. The hold is measured in ticks from a ticker process rather than from any clock in
@@ -29,7 +36,8 @@
 #
 
 PROG=`basename $0`
-HOLD=300                                # ms to wait before printing a transmission
+HOLD=400                                # ms to wait before printing a transmission
+REPLY=200                               # ms within which an answer counts as the reply
 TICK=100                                # ms per tick
 SUMMARY=60                              # seconds between the rolling tally lines
 FROM=0                                  # -c argument for tail: 0 = EOF, +1 = whole file
@@ -37,23 +45,26 @@ FROM=0                                  # -c argument for tail: 0 = EOF, +1 = wh
 usage()
 {
     cat >&2 << USAGE
-usage: $PROG [-w MS] [-s SECS] <capture.pcap> ...
+usage: $PROG [-w MS] [-R MS] [-s SECS] [-a] <capture.pcap> ...
 
   -w MS      hold each transmission this long before printing it   [$HOLD]
+  -R MS      count an answer starting this soon after as the reply [$REPLY]
   -s SECS    seconds between rolling tally lines (0 = none)        [$SUMMARY]
   -a         replay each file from the start first, then follow it
   -h         this help
 
   Point it at the files espnow-collect is writing, while it is writing them.
   Column headers are the last octet of each collector's address.
+  REPLY: yes/no = did the destination answer it, re = it is an answer.
 USAGE
     exit 1
 }
 
-while getopts w:s:ah OPT
+while getopts w:R:s:ah OPT
 do
     case $OPT in
     w)  HOLD=$OPTARG ;;
+    R)  REPLY=$OPTARG ;;
     s)  SUMMARY=$OPTARG ;;
     a)  FROM=+1 ;;
     *)  usage ;;
@@ -62,6 +73,18 @@ done
 shift `expr $OPTIND - 1`
 
 [ $# -ge 1 ] || usage
+
+#
+# a reply can only mark a line that has not been printed yet, so the hold has to cover the reply
+# window - and then some: the hold is counted in whole ticks, which makes the shortest real hold
+# a tick less than asked for, and the answer may travel a slower collector's pipe than the request
+#
+MINHOLD=`expr $REPLY + 2 \* $TICK`
+if [ $HOLD -lt $MINHOLD ]
+then
+    echo "$PROG: a $HOLD ms hold cannot see a $REPLY ms reply through, holding $MINHOLD ms" >&2
+    HOLD=$MINHOLD
+fi
 
 #
 # an explicit NAMES that cannot be read is a typo, not a request for raw MACs - say so,
@@ -128,7 +151,8 @@ done
     done &
 
     wait
-} | gawk -F '\t' -v NAMES="$NAMES" -v LBLS="$LBLS" -v HOLD=$HOLD -v TICK=$TICK -v SUMMARY=$SUMMARY '
+} | gawk -F '\t' -v NAMES="$NAMES" -v LBLS="$LBLS" -v HOLD=$HOLD -v TICK=$TICK -v SUMMARY=$SUMMARY \
+           -v REPLY=$REPLY '
 func nm(a)      { return (a in NAME) ? NAME[a] : a }
 func nmw(a, w)  { return substr(nm(a), 1, w) }
 
@@ -146,8 +170,11 @@ BEGIN {
     hold_ticks = HOLD / TICK
     if (hold_ticks < 1)
         hold_ticks = 1
+    reply_s = REPLY / 1000                      # the data is in seconds
+    keep_ticks = hold_ticks + int(REPLY / TICK) + 2     # how long a printed line can still be
+                                                        # found by an answer that comes late
 
-    printf("%-15s %-19s %-19s %6s %6s", "TIME", "SOURCE", "DEST", "SEQ", "FRAMES")
+    printf("%-15s %-19s %-19s %6s %6s %5s", "TIME", "SOURCE", "DEST", "SEQ", "FRAMES", "REPLY")
     for (i = 1; i <= nc; i++)
         printf(" %5s", col[i])
     printf("  PAYLOAD\n")
@@ -157,6 +184,7 @@ BEGIN {
 /^T$/ {                                         # a tick: age the oldest entries out
     tick++
     flush_ready()
+    forget_old()
     #
     # the tally has to come out as we go. gawk runs END on EOF, and a live view ends by
     # Ctrl-C or a kill, neither of which gets there - so an END-only summary is a summary
@@ -180,7 +208,7 @@ BEGIN {
 NF != 11 { next }                               # not a machine mode frame line
 
 {
-    lbl = $1; ts = $2 + 0; rssi = $3; seq = $4; sa = $7; da = $8; id = $9; pl = $11
+    lbl = $1; ts = $2 + 0; rssi = $3; seq = $4; rty = $5; sa = $7; da = $8; id = $9; pl = $11
 
     if (sa ~ /^02:00:00/)                       # a collector reporting its own health:
         next                                    # only ever heard by itself, so it would
@@ -190,17 +218,172 @@ NF != 11 { next }                               # not a machine mode frame line
         born[k] = tick
         ord[++last] = k                         # printed in arrival order, not hash order
         TS[k] = ts; SA[k] = sa; DA[k] = da; SEQ[k] = seq
+        if (!(k in live)) {                     # filed by direction, for its answer to find
+            live[k] = sa "|" da
+            DIR[sa "|" da] = DIR[sa "|" da] " " k
+        }
     }
     PL[k] = pl                                  # a retry may carry the payload the first
                                                 # frame was missing
     n[k "|" lbl]++
+    if (!((k "|" lbl) in F))
+        F[k "|" lbl] = ts                       # when it started, by the clock of this collector
+    if (rty == "-" && !((k "|" lbl) in O))
+        sync(k, lbl, ts)
     if (n[k "|" lbl] > mx[k])
         mx[k] = n[k "|" lbl]
     if (rssi != "?" && (!((k "|" lbl) in r) || rssi + 0 > r[k "|" lbl]))
         r[k "|" lbl] = rssi + 0
 }
 
-func flush_ready(   i, k, c, miss)
+#
+# every collector stamps frames by its own clock, and those disagree by anything up to a couple of
+# hundred ms, drifting apart between time syncs - several times what a reply takes. so an answer is
+# timed on the clock of a collector that heard both sides. where none did, two clocks are bridged
+# at their offset as last measured: the first frame of a transmission is one event on the air,
+# stamped by every collector that heard it
+#
+func sync(k, lbl, ts,   i, c)
+{
+    O[k "|" lbl] = ts
+    for (i = 1; i <= nc; i++) {
+        c = col[i]
+        if (c != lbl && ((k "|" c) in O)) {
+            OFF[lbl, c] = ts - O[k "|" c]
+            OFF[c, lbl] = O[k "|" c] - ts
+            OFFAT[lbl, c] = OFFAT[c, lbl] = ts
+        }
+    }
+}
+
+func since(p, q,   i, j, a, b, t)           # seconds from the start of p to the start of q,
+{                                           # or "" when no clock can tell
+    for (i = 1; i <= nc; i++) {
+        a = col[i]
+        if (((p "|" a) in F) && ((q "|" a) in F))
+            return F[q "|" a] - F[p "|" a]
+    }
+    for (i = 1; i <= nc; i++) {
+        a = col[i]
+        if (!((p "|" a) in F))
+            continue
+        for (j = 1; j <= nc; j++) {
+            b = col[j]
+            if (!((q "|" b) in F) || !((a, b) in OFF))
+                continue
+            t = F[q "|" b] - OFFAT[a, b]
+            if (t > -300 && t < 300)            # an older offset has drifted too far
+                return F[q "|" b] + OFF[a, b] - F[p "|" a]
+        }
+    }
+    return ""
+}
+
+#
+# which way the answers go is learned rather than configured: each pairing made on timing counts
+# an ask for one direction and an answer for the other. timing alone goes wrong exactly where it
+# matters: when no collector heard a request, its answer looks like a request of its own, and the
+# next transmission of the device - often well inside the window - like the answer to that. so a
+# direction that has only ever answered is not taken to ask, nor one that only ever asks to answer
+#
+func answers(d) { return re[d] >= 3 && re[d] >= 4 * rq[d] }
+func asks(d)    { return rq[d] >= 3 && rq[d] >= 4 * re[d] }
+
+func reply_mark(k,   d, rv, m, L, i, q, t, best, bt)
+{
+    if (k in ISRE)
+        return "re"
+    if (k in ANS)
+        return "yes"
+    if (DA[k] ~ /^.[13579bdf]/)                 # group addressed: nobody in particular to answer
+        return "-"
+    d = SA[k] "|" DA[k]
+    rv = DA[k] "|" SA[k]
+    m = (rv in DIR) ? split(DIR[rv], L, " ") : 0      # a bare DIR[rv] would create it
+    #
+    # is it the answer to something its destination sent it?
+    #
+    if (!asks(d)) {
+        best = ""
+        if (!answers(rv))
+            for (i = 1; i <= m; i++) {
+                q = L[i]
+                if ((q in ISRE) || (q in ANS))
+                    continue
+                t = since(q, k)
+                if (t != "" && t > 0 && t <= reply_s && (best == "" || t < bt)) {
+                    best = q
+                    bt = t
+                }
+            }
+        if (best != "") {
+            ISRE[k] = ANS[best] = 1
+            rq[rv]++
+            re[d]++
+            return "re"
+        }
+        if (answers(d)) {                       # to a request nobody heard - or nobody yet:
+            ISRE[k] = ORPH[k] = 1               # a slower collector may still bring it in
+            return "re"
+        }
+    }
+    #
+    # did its destination answer it?
+    #
+    if (asks(rv))
+        return "no"
+    best = ""
+    for (i = 1; i <= m; i++) {
+        q = L[i]
+        if (((q in ISRE) && !(q in ORPH)) || (q in ANS))
+            continue
+        t = since(k, q)
+        if (t != "" && t > 0 && t <= reply_s && (best == "" || t < bt)) {
+            best = q
+            bt = t
+        }
+    }
+    if (best == "")
+        return "no"
+    ANS[k] = ISRE[best] = 1
+    delete ORPH[best]
+    rq[d]++
+    re[rv]++
+    return "yes"
+}
+
+#
+# a printed line stays findable for a while, so an answer that reaches us after it can still be
+# recognised as one - it cannot mark the line any more, but it no longer passes for a request
+#
+func forget_old(   k, t, d, s, i)
+{
+    while (gone < done && tick - done_t[gone + 1] >= keep_ticks) {
+        k = done_k[++gone]
+        t = done_t[gone]
+        delete done_k[gone]
+        delete done_t[gone]
+        if ((k in born) || flushed[k] != t)
+            continue                            # late frames brought it back: its next
+                                                # printing is the one to clear it
+        d = live[k]
+        s = DIR[d] " "
+        i = index(s, " " k " ")                 # not sub(): a key is full of regex characters
+        if (i) {
+            s = substr(s, 1, i - 1) substr(s, i + length(k) + 1)
+            DIR[d] = substr(s, 1, length(s) - 1)
+        }
+        if (DIR[d] == "")
+            delete DIR[d]
+        delete live[k]; delete flushed[k]; delete ISRE[k]; delete ORPH[k]; delete ANS[k]
+        for (i = 1; i <= nc; i++) {
+            delete F[k "|" col[i]]
+            delete O[k "|" col[i]]
+        }
+    }
+}
+
+func flush_ready(   i, k, c, miss, mark)
 {
     while (first < last) {                      # ord is 1..last, so first+1 must be <= last
         k = ord[first + 1]
@@ -209,9 +392,10 @@ func flush_ready(   i, k, c, miss)
         first++                                 # are younger still - stop here
         delete ord[first]
 
-        printf("%-15s %-19s %-19s %6s %6d", \
+        mark = reply_mark(k)                    # before what it reads is cleared below
+        printf("%-15s %-19s %-19s %6s %6d %5s", \
                strftime("%H:%M:%S", int(TS[k])) sprintf(".%03d", (TS[k] - int(TS[k])) * 1000), \
-               nmw(SA[k], 19), nmw(DA[k], 19), SEQ[k], mx[k])
+               nmw(SA[k], 19), nmw(DA[k], 19), SEQ[k], mx[k], mark)
 
         miss = 0
         for (i = 1; i <= nc; i++) {
@@ -242,6 +426,8 @@ func flush_ready(   i, k, c, miss)
             delete n[k "|" col[i]]
             delete r[k "|" col[i]]
         }
+        done_k[++done] = k                      # but what an answer needs to find it stays,
+        done_t[done] = flushed[k] = tick        # until forget_old()
     }
 }
 

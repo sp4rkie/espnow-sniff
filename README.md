@@ -219,28 +219,45 @@ which is the opposite of why there is a mesh. `espnow-live` follows all of them 
 prints one line per transmission with a column per collector:
 
 ```
-TIME            SOURCE              DEST                   SEQ FRAMES    56    62    86  PAYLOAD
-08:39:19.453    sensor-1            gateway-a                0      1   -62   -88     -  "@temp@..."
-08:42:20.622    sensor-2            gateway-a                0      2   -75     -   -55  "@temp@..."
-08:45:52.837    remote-1            gateway-b                3     32   -84   -42   -62  "2B ^localhost ^86S ^"
+TIME            SOURCE              DEST                   SEQ FRAMES REPLY    56    62    86  PAYLOAD
+08:39:19.453    sensor-1            gateway-a                0      1   yes   -62   -88     -  "@temp@..."
+08:39:19.641    gateway-a           sensor-1              2471      1    re   -60   -71   -58  "#[XX]#[0]..."
+08:45:52.812    remote-1            gateway-a                2      1   yes   -84   -42   -62  "2B ^localhost ^86S ^"
+08:45:52.837    remote-1            gateway-b                3     32    no   -84   -42   -62  "2B ^localhost ^86S ^"
+08:45:52.851    gateway-a           remote-1              2472      1    re   -61   -70   -57  "#[XX]#[0]..."
 --- last 60s: 74 transmissions, 56 missed 12 (16%), 62 missed 9 (12%), 86 missed 9 (12%)
 ```
 
 A `-` is a collector that never heard that transmission. `FRAMES` is the highest count any one
-of them saw, so 32 is a transmission that exhausted its retries — the destination never
-acknowledged it.
+of them saw, so it is a lower bound on what was sent: 32 is the hardware retry limit, where no
+acknowledgement ever came back, and a 29 or 30 in its place is usually the same thing with a
+few retries no collector caught.
+
+`REPLY` is what tells you whether a destination actually got a transmission: `yes` or `no` on a
+request, `re` on an answer. Anything from B to A that starts within 200 ms (`-R`) of A's
+transmission to B counts as its reply. The frame count cannot tell you this either way — a
+destination can receive a transmission and lose its acknowledgement on the way back, so that the
+sender retries to the limit although it got through.
+
+Each collector stamps frames by its own clock, and those disagree by up to a couple of hundred
+milliseconds — more than a reply takes — so an answer is timed on the clock of a collector that
+heard both sides, or else across two clocks at their offset as last measured from a frame both
+heard. Which direction carries the answers is learned as it goes, since timing alone fails just
+when a request went unheard: its answer would pass for a request, and the next transmission of
+the device, often well inside the window, for the answer to that.
 
 Each file is joined at its **end** by default, so you see what is happening now rather than
 waiting for a long capture to replay; `-a` replays from the start instead. Joining a stream in
 progress works because a sniffer re-emits the pcap global header every few seconds for exactly
 that purpose.
 
-A live merge cannot know when a transmission is over, so each is held briefly (`-w`, 300 ms
+A live merge cannot know when a transmission is over, so each is held briefly (`-w`, 400 ms
 default) and then printed with whoever reported it in that window — a collector that is merely
-slow will show as a miss. The hold is counted in ticks from a ticker process, never from
-timestamps in the data, so clock skew between collectors cannot affect it. The tally line
-repeats every `-s` seconds (60 by default) because a live view ends with Ctrl-C, which never
-reaches an `END` block.
+slow will show as a miss, and an answer arriving after its request was printed cannot mark it,
+so the hold never drops below the reply window plus two ticks. The hold is counted in ticks
+from a ticker process, never from timestamps in the data, so clock skew between collectors
+cannot affect it. The tally line repeats every `-s` seconds (60 by default) because a live view
+ends with Ctrl-C, which never reaches an `END` block.
 
 ## Notes
 
