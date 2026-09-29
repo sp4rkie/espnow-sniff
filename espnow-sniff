@@ -176,7 +176,7 @@ BEGIN {
     drain()
 }
 
-func drain(   caplen, tot, i)
+func drain(   caplen, tot, i, q)
 {
     while (1) {
         if (!GH) {
@@ -209,11 +209,61 @@ func drain(   caplen, tot, i)
         tot = 16 + caplen
         if (N - P < tot)
             return
+        #
+        # ... but a record cut short still claims its full length, and the header the
+        # source sends on reconnecting follows it at once. read whole, the cut record
+        # swallows that header and runs on into the new stream, which falls apart until
+        # the next repeated header, up to 10 s later. worse, its garbled tail prints as a
+        # frame - and if the cut came early, as a frame from a device that does not
+        # exist. so a record with a header inside it was cut: drop it, resume at the header
+        #
+        if ((q = cut_at(P + 16, P + tot)) >= 0) {
+            for (i = P; i < q; i++)
+                delete B[i]
+            P = q
+            CUTS++
+            continue
+        }
         pkt(P + 16, caplen, p32(P), p32(P + 4))
         for (i = P; i < P + tot; i++)
             delete B[i]
         P += tot
     }
+}
+
+#
+# where in [a, e) a global header starts, or -1. it never waits for more input to be
+# sure, because holding the last record of a burst until the next one arrives is the
+# one thing the live path must not do: a magic whose tail is not in yet counts
+#
+func cut_at(a, e,   i, b)
+{
+    for (i = a; i + 4 <= e; i++) {
+        b = B[i]
+        if (b != 212 && b != 161 && b != 77)        # 0xd4 0xa1 0x4d, how the magics begin
+            continue
+        if (!is_magic(i))
+            continue
+        if (i + 24 <= N) {
+            if (is_ghdr(i))
+                return i
+        } else if (i + 8 > N || ghdr_ver(i))
+            return i
+    }
+    return -1
+}
+
+func is_magic(o,   m)
+{
+    m = sprintf("%02x%02x%02x%02x", B[o], B[o+1], B[o+2], B[o+3])
+    return m == "d4c3b2a1" || m == "a1b2c3d4" || m == "4d3cb2a1" || m == "a1b23c4d"
+}
+
+func ghdr_ver(o)                                    # version 2.4, in the magic's byte order
+{
+    if (B[o] == 161)
+        return B[o+4] == 0 && B[o+5] == 2 && B[o+6] == 0 && B[o+7] == 4
+    return B[o+4] == 2 && B[o+5] == 0 && B[o+6] == 4 && B[o+7] == 0
 }
 
 func is_ghdr(o,   m)
@@ -234,17 +284,21 @@ func ghdr(   m, i)
     else {
         #
         # a serial source has boot chatter in front of the stream, so do not give up
-        # on the first bad byte - drop one and look again for the magic
+        # on the first bad byte - drop one and look again for the magic. the 64k limit
+        # is for input that was never pcap at all: it used to count every byte skipped
+        # in the whole stream, so a source with a few reboots behind it died of chatter
+        # 5K at a time. once a header has been seen, another one will come - on a busy
+        # channel they were up to 155K apart - so keep looking
         #
         delete B[P]
         P++
-        if (++SKIPPED <= 65536)
+        if (SYNCED || ++SKIPPED <= 65536)
             return -1
         print "espnow-sniff: no pcap header in the first 64k of input" > "/dev/stderr"
         return 0
     }
     if ((DLT = p32(P + 20)) != 127) {
-        if (SKIPPED) {                              # false magic while resynchronising
+        if (SKIPPED || SYNCED) {                    # false magic while resynchronising
             delete B[P]
             P++
             return -1
@@ -256,6 +310,7 @@ func ghdr(   m, i)
         delete B[i]
     P += 24
     GH = 1
+    SYNCED = 1
     return 1
 }
 
@@ -439,8 +494,8 @@ END {
         printf("\n--- no ESP-NOW frames (%d frames examined, %d bad FCS) ---\n", TOTAL, BADFCS)
         exit
     }
-    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds; %d bad FCS, %d not decoded, %d resync ---\n", \
-           ESPNOW, length(CNT), T1 - T0, BADFCS, TOTAL - ESPNOW - BADFCS, RESYNCS)
+    printf("\n--- %d ESP-NOW frames from %d device(s) over %ds; %d bad FCS, %d not decoded, %d resync, %d cut short ---\n", \
+           ESPNOW, length(CNT), T1 - T0, BADFCS, TOTAL - ESPNOW - BADFCS, RESYNCS, CUTS)
     for (s in CNT)
         printf("  %-19s %6d  rssi %4s/%4s/%4s dBm  last: \"%s\"\n", \
             nm(s), CNT[s], \
